@@ -189,8 +189,11 @@ export default function App() {
   });
 
   const forceRerender = useCallback(() => {
-    // Used by PropertyPanel to notify us when selected object mutates.
-    setSelected((s) => (s ? ({ ...s } as unknown as LayeredObject) : s));
+    // PropertyPanel mutates the selected Fabric object in-place and calls this
+    // so the canvas re-renders. We must NOT replace `selected` with a spread
+    // copy — that strips the Fabric prototype and would crash PropertyPanel's
+    // useEffect when it attaches transform listeners on the next render.
+    editorRef.current?.canvas?.requestRenderAll();
   }, []);
 
   return (
