@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/components/EditorCanvas.tsx","./src/components/PropertyPanel.tsx","./src/components/Toolbar.tsx","./src/lib/htmlImporter.ts","./src/lib/sceneToFabric.ts"],"version":"5.9.3"}
