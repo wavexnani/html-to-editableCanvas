@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Canvas, FabricImage, Rect, Textbox } from "fabric";
-import { Toolbar } from "./components/Toolbar";
+import { Canvas, FabricImage } from "fabric";
+import { TopToolbar } from "./components/TopToolbar";
+import { LayersPanel } from "./components/LayersPanel";
+import { Inspector } from "./components/Inspector";
+import { BottomBar } from "./components/BottomBar";
 import { EditorCanvas, type EditorCanvasHandle } from "./components/EditorCanvas";
-import { PropertyPanel } from "./components/PropertyPanel";
 import { importHtml, disposeImport, type ImportResult } from "./lib/htmlImporter";
 import { layerToFabric, type LayeredObject } from "./lib/sceneToFabric";
 import type { Scene } from "./types";
@@ -32,6 +34,11 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>("Import an HTML file or click Load Sample to begin.");
   const [scene, setScene] = useState<Scene | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [, setChangeTick] = useState(0);
+  const bump = useCallback(() => setChangeTick((t) => t + 1), []);
 
   const getCanvas = (): Canvas | null => editorRef.current?.canvas ?? null;
 
@@ -41,9 +48,12 @@ export default function App() {
     let result: ImportResult | null = null;
     try {
       result = await importHtml(html);
-      setStatus(`Extracted ${result.scene.layers.length} layers · ${result.scene.width}×${result.scene.height}px`);
+      setStatus(
+        `${label}: ${result.scene.layers.length} layers · ${Math.round(result.scene.width)}×${Math.round(result.scene.height)}px`,
+      );
       setScene(result.scene);
       await editorRef.current?.loadScene(result.scene);
+      bump();
     } catch (err) {
       console.error(err);
       setStatus(`Import failed: ${(err as Error).message}`);
@@ -51,7 +61,7 @@ export default function App() {
       disposeImport(result);
       setBusy(false);
     }
-  }, []);
+  }, [bump]);
 
   const handleImportFile = useCallback(async (file: File) => {
     const html = await readFileAsText(file);
@@ -59,7 +69,7 @@ export default function App() {
   }, [doImport]);
 
   const handleLoadSample = useCallback(async () => {
-    await doImport(sampleHtml, "sample (ClassSwipe V9)");
+    await doImport(sampleHtml, "classswipe_v9.html");
   }, [doImport]);
 
   const handleAddText = useCallback(async () => {
@@ -68,27 +78,33 @@ export default function App() {
     const layer = await layerToFabric({
       id: `t_new_${Date.now()}`,
       kind: "text",
-      x: 40,
-      y: 40,
-      width: 280,
-      height: 60,
+      name: "New text",
+      x: 60,
+      y: 60,
+      width: 320,
+      height: 80,
       rotation: 0,
-      text: "New text",
-      fontFamily: "Inter, sans-serif",
-      fontSize: 36,
-      fontWeight: 600,
-      fontStyle: "normal",
-      color: "#ffffff",
-      letterSpacing: 0,
-      lineHeight: 1.2,
-      textAlign: "left",
       opacity: 1,
+      visible: true,
+      locked: false,
+      text: "New text",
+      fontFamily: "Syne",
+      fontSize: 40,
+      fontWeight: 700,
+      fontStyle: "normal",
+      color: "#f2f4f7",
+      letterSpacing: 0,
+      lineHeight: 1.15,
+      textAlign: "left",
+      textTransform: "none",
+      textDecoration: "none",
     });
     canvas.add(layer);
     canvas.setActiveObject(layer);
     canvas.requestRenderAll();
     setSelected(layer);
-  }, []);
+    bump();
+  }, [bump]);
 
   const handleAddRect = useCallback(async () => {
     const canvas = getCanvas();
@@ -96,22 +112,25 @@ export default function App() {
     const layer = await layerToFabric({
       id: `r_new_${Date.now()}`,
       kind: "rect",
-      x: 80,
-      y: 80,
-      width: 220,
-      height: 140,
+      name: "Rectangle",
+      x: 100,
+      y: 100,
+      width: 260,
+      height: 160,
       rotation: 0,
-      fill: "#4f8cff",
-      stroke: "",
-      strokeWidth: 0,
-      radius: 12,
       opacity: 1,
+      visible: true,
+      locked: false,
+      fill: { type: "solid", color: "#4f8cff" },
+      stroke: null,
+      radius: { tl: 16, tr: 16, br: 16, bl: 16 },
     });
     canvas.add(layer);
     canvas.setActiveObject(layer);
     canvas.requestRenderAll();
     setSelected(layer);
-  }, []);
+    bump();
+  }, [bump]);
 
   const handleAddImage = useCallback(async (file: File) => {
     const canvas = getCanvas();
@@ -119,27 +138,26 @@ export default function App() {
     const src = await readFileAsDataUrl(file);
     const img = await FabricImage.fromURL(src);
     img.set({ left: 60, top: 60 });
-    // Clamp to reasonable size
     const maxW = 600;
     if ((img.width ?? 0) > maxW) {
       const s = maxW / (img.width ?? 1);
       img.scale(s);
     }
     (img as LayeredObject).layerKind = "image";
+    (img as LayeredObject).layerName = file.name || "image";
+    (img as LayeredObject).layerId = `i_new_${Date.now()}`;
     canvas.add(img);
     canvas.setActiveObject(img);
     canvas.requestRenderAll();
     setSelected(img as LayeredObject);
-  }, []);
+    bump();
+  }, [bump]);
 
   const handleExportPng = useCallback(() => {
     const canvas = getCanvas();
     if (!canvas) return;
-    if (!scene) {
-      setStatus("Nothing to export — import a design first.");
-      return;
-    }
-    // Export at logical scene size regardless of current zoom/viewport.
+    const w = scene?.width ?? canvas.getWidth();
+    const h = scene?.height ?? canvas.getHeight();
     const vpt = canvas.viewportTransform;
     const currentVpt: [number, number, number, number, number, number] | null = vpt
       ? [vpt[0], vpt[1], vpt[2], vpt[3], vpt[4], vpt[5]]
@@ -152,8 +170,8 @@ export default function App() {
       multiplier: 1,
       left: 0,
       top: 0,
-      width: scene.width,
-      height: scene.height,
+      width: w,
+      height: h,
     });
     if (currentVpt) canvas.setViewportTransform(currentVpt);
     canvas.setZoom(currentZoom);
@@ -167,7 +185,7 @@ export default function App() {
   const handleExportJson = useCallback(() => {
     const canvas = getCanvas();
     if (!canvas) return;
-    const json = canvas.toObject(["layerId", "layerKind", "isBackground"]);
+    const json = canvas.toObject(["layerId", "layerKind", "layerName", "isBackground"]);
     const blob = new Blob([JSON.stringify(json, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
@@ -176,8 +194,6 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }, []);
 
-  // Also expose a "delete selected" UX hint via a keyboard-only path (handled
-  // in EditorCanvas). Clean up selection when object is removed.
   useEffect(() => {
     const canvas = getCanvas();
     if (!canvas) return;
@@ -188,29 +204,25 @@ export default function App() {
     };
   });
 
-  const forceRerender = useCallback(() => {
-    // PropertyPanel mutates the selected Fabric object in-place and calls this
-    // so the canvas re-renders. We must NOT replace `selected` with a spread
-    // copy — that strips the Fabric prototype and would crash PropertyPanel's
-    // useEffect when it attaches transform listeners on the next render.
+  const rerender = useCallback(() => {
     editorRef.current?.canvas?.requestRenderAll();
-  }, []);
+    bump();
+  }, [bump]);
 
   return (
     <div className="app-shell">
       <header className="app-header">
         <div className="app-title">
+          <span className="app-logo">⌘</span>
           <strong>HTML → Editable Canvas</strong>
-          <span className="muted">Paste a design · edit like Canva · export</span>
-        </div>
-        <div className="status" aria-live="polite">
-          {busy ? <span className="spinner" /> : null}
-          <span>{status}</span>
+          <span className="muted small">v2 · Canva-grade vector extractor</span>
         </div>
       </header>
 
-      <Toolbar
-        busy={busy}
+      <TopToolbar
+        canvas={getCanvas()}
+        selected={selected}
+        onChange={rerender}
         onImportFile={handleImportFile}
         onLoadSample={handleLoadSample}
         onAddText={handleAddText}
@@ -218,18 +230,40 @@ export default function App() {
         onAddImage={handleAddImage}
         onExportPng={handleExportPng}
         onExportJson={handleExportJson}
-        onZoomIn={() => editorRef.current?.zoomIn()}
-        onZoomOut={() => editorRef.current?.zoomOut()}
-        onZoomFit={() => editorRef.current?.zoomToFit()}
+        onUndo={() => editorRef.current?.undo()}
+        onRedo={() => editorRef.current?.redo()}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        busy={busy}
       />
 
       <main className="app-main">
-        <EditorCanvas ref={editorRef} onSelectionChange={setSelected} />
-        <PropertyPanel canvas={getCanvas()} selected={selected} onChange={forceRerender} />
+        <LayersPanel
+          canvas={getCanvas()}
+          selected={selected}
+          onSelect={setSelected}
+          onChange={rerender}
+        />
+        <EditorCanvas
+          ref={editorRef}
+          onSelectionChange={setSelected}
+          onHistoryChange={(u, r) => {
+            setCanUndo(u);
+            setCanRedo(r);
+          }}
+          onZoomChange={setZoom}
+        />
+        <Inspector canvas={getCanvas()} selected={selected} onChange={rerender} />
       </main>
+
+      <BottomBar
+        zoom={zoom}
+        onZoomIn={() => editorRef.current?.zoomIn()}
+        onZoomOut={() => editorRef.current?.zoomOut()}
+        onZoomFit={() => editorRef.current?.zoomToFit()}
+        onZoomReset={() => editorRef.current?.zoomReset()}
+        status={busy ? `${status}` : status}
+      />
     </div>
   );
 }
-
-// Prevent unused-import warnings for types used only indirectly.
-export type { Textbox, Rect };
