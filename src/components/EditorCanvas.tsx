@@ -9,30 +9,41 @@ import {
 import { Canvas, FabricObject, Point, TPointerEventInfo } from "fabric";
 import type { Scene } from "../types";
 import { loadScene, type LayeredObject } from "../lib/sceneToFabric";
+import { createHistory, type HistoryHandle } from "../lib/history";
 
 export interface EditorCanvasHandle {
   canvas: Canvas | null;
+  history: HistoryHandle | null;
+  zoom: number;
   zoomIn: () => void;
   zoomOut: () => void;
   zoomToFit: () => void;
+  zoomReset: () => void;
   loadScene: (scene: Scene) => Promise<void>;
+  undo: () => Promise<void>;
+  redo: () => Promise<void>;
 }
 
 interface Props {
   onSelectionChange: (selected: LayeredObject | null) => void;
+  onHistoryChange?: (canUndo: boolean, canRedo: boolean) => void;
+  onZoomChange?: (zoom: number) => void;
 }
 
 const MIN_ZOOM = 0.05;
-const MAX_ZOOM = 4;
+const MAX_ZOOM = 6;
 
 export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function EditorCanvas(
-  { onSelectionChange },
+  { onSelectionChange, onHistoryChange, onZoomChange },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasElRef = useRef<HTMLCanvasElement | null>(null);
   const fabricRef = useRef<Canvas | null>(null);
+  const historyRef = useRef<HistoryHandle | null>(null);
+  const sceneSizeRef = useRef<{ w: number; h: number }>({ w: 1200, h: 800 });
   const [size, setSize] = useState({ width: 1200, height: 800 });
+  const [zoom, setZoom] = useState(1);
 
   // Resize observer keeps Fabric sized to the container.
   useEffect(() => {
@@ -55,6 +66,10 @@ export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function Edito
     });
     fabricRef.current = canvas;
 
+    const history = createHistory(canvas);
+    historyRef.current = history;
+    history.subscribe(() => onHistoryChange?.(history.canUndo(), history.canRedo()));
+
     const emitSelection = () => {
       const active = canvas.getActiveObject() as LayeredObject | null;
       onSelectionChange(active ?? null);
@@ -63,7 +78,7 @@ export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function Edito
     canvas.on("selection:updated", emitSelection);
     canvas.on("selection:cleared", () => onSelectionChange(null));
 
-    // Pan with space or middle mouse
+    // Pan with Alt/middle-mouse
     let isPanning = false;
     let lastPoint: Point | null = null;
     const onMouseDown = (e: TPointerEventInfo) => {
@@ -95,17 +110,19 @@ export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function Edito
     canvas.on("mouse:move", onMouseMove);
     canvas.on("mouse:up", onMouseUp);
 
-    // Wheel zoom (ctrl/cmd + wheel), otherwise pan
+    // Wheel zoom / pan
     const onWheel = (e: TPointerEventInfo<WheelEvent>) => {
       const evt = e.e;
       if (evt.ctrlKey || evt.metaKey) {
         evt.preventDefault();
         evt.stopPropagation();
         const delta = evt.deltaY;
-        let zoom = canvas.getZoom();
-        zoom *= 0.999 ** delta;
-        zoom = Math.min(Math.max(zoom, MIN_ZOOM), MAX_ZOOM);
-        canvas.zoomToPoint(new Point(evt.offsetX, evt.offsetY), zoom);
+        let z = canvas.getZoom();
+        z *= 0.999 ** delta;
+        z = Math.min(Math.max(z, MIN_ZOOM), MAX_ZOOM);
+        canvas.zoomToPoint(new Point(evt.offsetX, evt.offsetY), z);
+        setZoom(z);
+        onZoomChange?.(z);
       } else {
         evt.preventDefault();
         const vpt = canvas.viewportTransform;
@@ -120,8 +137,9 @@ export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function Edito
     return () => {
       canvas.dispose();
       fabricRef.current = null;
+      historyRef.current = null;
     };
-  }, [onSelectionChange]);
+  }, [onSelectionChange, onHistoryChange, onZoomChange]);
 
   // Keep Fabric canvas element sized to container.
   useEffect(() => {
@@ -135,26 +153,102 @@ export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function Edito
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const canvas = fabricRef.current;
+      const history = historyRef.current;
       if (!canvas) return;
-      const active = canvas.getActiveObject();
       const target = e.target as HTMLElement | null;
       const typingInField =
         target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
       if (typingInField) return;
-      if ((e.key === "Delete" || e.key === "Backspace") && active) {
-        const activeObjects = canvas.getActiveObjects() as FabricObject[];
-        activeObjects.forEach((o) => canvas.remove(o));
+      const active = canvas.getActiveObject();
+
+      const meta = e.ctrlKey || e.metaKey;
+
+      // Undo / Redo — always available.
+      if (meta && (e.key === "z" || e.key === "Z") && !e.shiftKey) {
+        e.preventDefault();
+        history?.undo();
+        return;
+      }
+      if (meta && ((e.key === "z" || e.key === "Z") && e.shiftKey)) {
+        e.preventDefault();
+        history?.redo();
+        return;
+      }
+      if (meta && (e.key === "y" || e.key === "Y")) {
+        e.preventDefault();
+        history?.redo();
+        return;
+      }
+
+      if (!active) return;
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        const actives = canvas.getActiveObjects() as FabricObject[];
+        actives.forEach((o) => canvas.remove(o));
         canvas.discardActiveObject();
         canvas.requestRenderAll();
+        return;
       }
-      if ((e.key === "d" || e.key === "D") && (e.ctrlKey || e.metaKey) && active) {
+      if (meta && (e.key === "d" || e.key === "D")) {
         e.preventDefault();
         active.clone().then((clone: FabricObject) => {
           clone.set({ left: (active.left ?? 0) + 16, top: (active.top ?? 0) + 16 });
+          const src = active as LayeredObject;
+          (clone as LayeredObject).layerId = `${src.layerId ?? "obj"}_copy_${Date.now().toString(36)}`;
+          (clone as LayeredObject).layerKind = src.layerKind;
+          (clone as LayeredObject).layerName = (src.layerName ?? "object") + " copy";
           canvas.add(clone);
           canvas.setActiveObject(clone);
           canvas.requestRenderAll();
         });
+        return;
+      }
+      // z-order
+      if (meta && e.key === "]") {
+        e.preventDefault();
+        if (e.shiftKey) canvas.bringObjectToFront(active);
+        else canvas.bringObjectForward(active);
+        canvas.requestRenderAll();
+        return;
+      }
+      if (meta && e.key === "[") {
+        e.preventDefault();
+        if (e.shiftKey) canvas.sendObjectToBack(active);
+        else canvas.sendObjectBackwards(active);
+        canvas.requestRenderAll();
+        return;
+      }
+
+      // Arrow nudging
+      const step = e.shiftKey ? 10 : 1;
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        active.set({ top: (active.top ?? 0) - step });
+        active.setCoords();
+        canvas.requestRenderAll();
+        canvas.fire("object:modified", { target: active });
+      }
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        active.set({ top: (active.top ?? 0) + step });
+        active.setCoords();
+        canvas.requestRenderAll();
+        canvas.fire("object:modified", { target: active });
+      }
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        active.set({ left: (active.left ?? 0) - step });
+        active.setCoords();
+        canvas.requestRenderAll();
+        canvas.fire("object:modified", { target: active });
+      }
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        active.set({ left: (active.left ?? 0) + step });
+        active.setCoords();
+        canvas.requestRenderAll();
+        canvas.fire("object:modified", { target: active });
       }
     };
     window.addEventListener("keydown", onKey);
@@ -164,50 +258,89 @@ export const EditorCanvas = forwardRef<EditorCanvasHandle, Props>(function Edito
   const fitScene = useCallback((sceneWidth: number, sceneHeight: number) => {
     const canvas = fabricRef.current;
     if (!canvas) return;
-    const pad = 48;
+    const pad = 64;
     const scale = Math.min(
       (size.width - pad) / sceneWidth,
       (size.height - pad) / sceneHeight,
       1,
     );
-    const zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, scale));
-    canvas.setZoom(zoom);
+    const z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, scale));
+    canvas.setZoom(z);
     const vpt = canvas.viewportTransform;
     if (vpt) {
-      vpt[4] = (size.width - sceneWidth * zoom) / 2;
-      vpt[5] = (size.height - sceneHeight * zoom) / 2;
+      vpt[4] = (size.width - sceneWidth * z) / 2;
+      vpt[5] = (size.height - sceneHeight * z) / 2;
       canvas.setViewportTransform(vpt);
     }
     canvas.requestRenderAll();
-  }, [size]);
+    setZoom(z);
+    onZoomChange?.(z);
+  }, [size, onZoomChange]);
 
   useImperativeHandle(ref, () => ({
     get canvas() {
       return fabricRef.current;
     },
+    get history() {
+      return historyRef.current;
+    },
+    get zoom() {
+      return zoom;
+    },
     zoomIn: () => {
       const canvas = fabricRef.current;
       if (!canvas) return;
-      const zoom = Math.min(MAX_ZOOM, canvas.getZoom() * 1.2);
-      canvas.zoomToPoint(new Point(size.width / 2, size.height / 2), zoom);
+      const z = Math.min(MAX_ZOOM, canvas.getZoom() * 1.2);
+      canvas.zoomToPoint(new Point(size.width / 2, size.height / 2), z);
+      setZoom(z);
+      onZoomChange?.(z);
     },
     zoomOut: () => {
       const canvas = fabricRef.current;
       if (!canvas) return;
-      const zoom = Math.max(MIN_ZOOM, canvas.getZoom() / 1.2);
-      canvas.zoomToPoint(new Point(size.width / 2, size.height / 2), zoom);
+      const z = Math.max(MIN_ZOOM, canvas.getZoom() / 1.2);
+      canvas.zoomToPoint(new Point(size.width / 2, size.height / 2), z);
+      setZoom(z);
+      onZoomChange?.(z);
     },
     zoomToFit: () => {
+      fitScene(sceneSizeRef.current.w, sceneSizeRef.current.h);
+    },
+    zoomReset: () => {
       const canvas = fabricRef.current;
       if (!canvas) return;
-      fitScene(canvas.getWidth(), canvas.getHeight());
+      canvas.setZoom(1);
+      const vpt = canvas.viewportTransform;
+      if (vpt) {
+        vpt[4] = (size.width - sceneSizeRef.current.w) / 2;
+        vpt[5] = (size.height - sceneSizeRef.current.h) / 2;
+        canvas.setViewportTransform(vpt);
+      }
+      canvas.requestRenderAll();
+      setZoom(1);
+      onZoomChange?.(1);
     },
     loadScene: async (scene) => {
       const canvas = fabricRef.current;
       if (!canvas) return;
-      await loadScene(canvas, scene);
+      const history = historyRef.current;
+      if (history) {
+        await history.suspend(async () => {
+          await loadScene(canvas, scene);
+        });
+        history.clear();
+      } else {
+        await loadScene(canvas, scene);
+      }
       canvas.setDimensions({ width: size.width, height: size.height }, { cssOnly: false });
+      sceneSizeRef.current = { w: scene.width, h: scene.height };
       fitScene(scene.width, scene.height);
+    },
+    undo: async () => {
+      await historyRef.current?.undo();
+    },
+    redo: async () => {
+      await historyRef.current?.redo();
     },
   }));
 
